@@ -1,0 +1,195 @@
+#include "esp_camera.h"
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <Wire.h>
+#include "DHT.h"
+#include "Adafruit_HTU21DF.h"
+
+// ===== WIFI =====
+const char* ssid = "NRL";
+const char* password = "9820805405111";
+
+// ===== GOOGLE SCRIPT =====
+String serverName =
+"https://script.google.com/macros/s/AKfycbw2M3Uz0b4BsNfGISKc8rIOi-wv7vZnOgJ8bHDR6H8MGPtDKFR3X4GXDLCJ3hzvOP9IQQ/exec";
+
+// ===== AI THINKER PINS =====
+#define PWDN_GPIO_NUM     32
+#define RESET_GPIO_NUM    -1
+#define XCLK_GPIO_NUM      0
+#define SIOD_GPIO_NUM     26
+#define SIOC_GPIO_NUM     27
+#define Y9_GPIO_NUM       35
+#define Y8_GPIO_NUM       34
+#define Y7_GPIO_NUM       39
+#define Y6_GPIO_NUM       36
+#define Y5_GPIO_NUM       21
+#define Y4_GPIO_NUM       19
+#define Y3_GPIO_NUM       18
+#define Y2_GPIO_NUM        5
+#define VSYNC_GPIO_NUM    25
+#define HREF_GPIO_NUM     23
+#define PCLK_GPIO_NUM     22
+
+// ===== SENSOR PINS =====
+#define DHTPIN     13
+#define DHTTYPE    DHT22     // change to DHT11 if that's what you actually have
+#define I2C_SDA    14
+#define I2C_SCL    15
+#define WATER_PIN   2
+#define SOIL_PIN   12
+#define LDR_PIN     4
+
+DHT dht(DHTPIN, DHTTYPE);
+Adafruit_HTU21DF htu = Adafruit_HTU21DF();
+
+const char PROGMEM b64_alphabet[] =
+"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+String base64Encode(uint8_t *data, size_t len) {
+  String result = "";
+  int i = 0;
+  uint8_t arr3[3];
+  uint8_t arr4[4];
+
+  while (len--) {
+    arr3[i++] = *(data++);
+    if (i == 3) {
+      arr4[0] = (arr3[0] & 0xfc) >> 2;
+      arr4[1] = ((arr3[0] & 0x03) << 4) + ((arr3[1] & 0xf0) >> 4);
+      arr4[2] = ((arr3[1] & 0x0f) << 2) + ((arr3[2] & 0xc0) >> 6);
+      arr4[3] = arr3[2] & 0x3f;
+      for (i = 0; i < 4; i++) result += b64_alphabet[arr4[i]];
+      i = 0;
+    }
+  }
+
+  if (i) {
+    for (int j = i; j < 3; j++) arr3[j] = '\0';
+    arr4[0] = (arr3[0] & 0xfc) >> 2;
+    arr4[1] = ((arr3[0] & 0x03) << 4) + ((arr3[1] & 0xf0) >> 4);
+    arr4[2] = ((arr3[1] & 0x0f) << 2) + ((arr3[2] & 0xc0) >> 6);
+    arr4[3] = arr3[2] & 0x3f;
+    for (int j = 0; j < i + 1; j++) result += b64_alphabet[arr4[j]];
+    while (i++ < 3) result += '=';
+  }
+  return result;
+}
+
+void setupCamera() {
+  camera_config_t config;
+  config.ledc_channel = LEDC_CHANNEL_0;
+  config.ledc_timer = LEDC_TIMER_0;
+  config.pin_d0 = Y2_GPIO_NUM;
+  config.pin_d1 = Y3_GPIO_NUM;
+  config.pin_d2 = Y4_GPIO_NUM;
+  config.pin_d3 = Y5_GPIO_NUM;
+  config.pin_d4 = Y6_GPIO_NUM;
+  config.pin_d5 = Y7_GPIO_NUM;
+  config.pin_d6 = Y8_GPIO_NUM;
+  config.pin_d7 = Y9_GPIO_NUM;
+  config.pin_xclk = XCLK_GPIO_NUM;
+  config.pin_pclk = PCLK_GPIO_NUM;
+  config.pin_vsync = VSYNC_GPIO_NUM;
+  config.pin_href = HREF_GPIO_NUM;
+  config.pin_sscb_sda = SIOD_GPIO_NUM;
+  config.pin_sscb_scl = SIOC_GPIO_NUM;
+  config.pin_pwdn = PWDN_GPIO_NUM;
+  config.pin_reset = RESET_GPIO_NUM;
+  config.xclk_freq_hz = 20000000;
+  config.pixel_format = PIXFORMAT_JPEG;
+  config.frame_size = FRAMESIZE_CIF;
+  config.jpeg_quality = 12;
+  config.fb_count = 1;
+
+  esp_err_t err = esp_camera_init(&config);
+  if (err != ESP_OK) {
+    Serial.printf("Camera init failed: 0x%x\n", err);
+  }
+}
+
+void uploadPhoto() {
+  camera_fb_t * fb = esp_camera_fb_get();
+  if (!fb) {
+    Serial.println("Camera Capture Failed");
+    return;
+  }
+
+  String imageBase64 = base64Encode(fb->buf, fb->len);
+  esp_camera_fb_return(fb);
+
+  // ===== Read DHT & HTU21D (NaN-safe) =====
+  float tempDHT = dht.readTemperature();
+  float humDHT  = dht.readHumidity();
+  if (isnan(tempDHT) || isnan(humDHT)) {
+    Serial.println("DHT read failed");
+    tempDHT = 0;
+    humDHT = 0;
+  }
+
+  float tempHTU = htu.readTemperature();
+  float humHTU  = htu.readHumidity();
+  if (isnan(tempHTU) || isnan(humHTU)) {
+    Serial.println("HTU21D read failed");
+    tempHTU = 0;
+    humHTU = 0;
+  }
+
+  // ===== Read analog sensors (0-4095) =====
+  int waterValue = analogRead(WATER_PIN);
+  int soilValue  = analogRead(SOIL_PIN);
+  int lightValue = analogRead(LDR_PIN);
+
+  Serial.printf("DHT    -> Temp: %.2f C, Hum: %.2f %%\n", tempDHT, humDHT);
+  Serial.printf("HTU21D -> Temp: %.2f C, Hum: %.2f %%\n", tempHTU, humHTU);
+  Serial.printf("Water: %d, Soil: %d, Light: %d\n", waterValue, soilValue, lightValue);
+
+  HTTPClient http;
+  http.begin(serverName);
+  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+  http.addHeader("Content-Type", "application/json");
+
+  String postData = "{\"image\":\"" + imageBase64 +
+                     "\",\"temp_dht\":" + String(tempDHT, 2) +
+                     ",\"hum_dht\":" + String(humDHT, 2) +
+                     ",\"temp_htu\":" + String(tempHTU, 2) +
+                     ",\"hum_htu\":" + String(humHTU, 2) +
+                     ",\"water\":" + String(waterValue) +
+                     ",\"soil\":" + String(soilValue) +
+                     ",\"light\":" + String(lightValue) + "}";
+
+  int httpResponseCode = http.POST(postData);
+  Serial.print("HTTP Response: ");
+  Serial.println(httpResponseCode);
+  if (httpResponseCode > 0) {
+    Serial.println(http.getString());
+  }
+  http.end();
+}
+
+void setup() {
+  Serial.begin(115200);
+
+  setupCamera();
+
+  Wire.begin(I2C_SDA, I2C_SCL);
+  dht.begin();
+  if (!htu.begin()) {
+    Serial.println("HTU21D not found!");
+  }
+
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("");
+  Serial.println("WiFi Connected");
+}
+
+void loop() {
+  Serial.println("Capturing Photo...");
+  uploadPhoto();
+  Serial.println("Waiting 10 sec...");
+  delay(10000);
+}
